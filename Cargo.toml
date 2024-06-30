@@ -1,0 +1,12 @@
+[package]
+name = "passacaglia"
+description = "A command-line library that generates music in the form of Lilypond files."
+version = "1.0.0"
+edition = "2021"
+license = "MPL-2.0 OR CC-BY-SA-4.0"
+keywords = ["music", "composition", "piano", "procedural", "generation"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5.8", features = ["derive"] }
+rand = "0.8.5"
