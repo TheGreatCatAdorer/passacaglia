@@ -1,7 +1,9 @@
 use std::{
+    f32::consts::PI,
     fmt::{Display, Write},
     fs::File,
     path::PathBuf,
+    process::exit,
 };
 
 use clap::Parser;
@@ -18,27 +20,167 @@ struct Args {
     /// Path to the Lilypond output
     #[arg(required = true)]
     output: PathBuf,
+    /// Which default values to use
+    /// Options: "1", "1.1"
+    #[arg(long, default_value_t = String::from("1"))]
+    preset: String,
+    /// The harmony preset to use
+    /// Options: "quarter", "center-8ths"
+    #[arg(long)]
+    harmony: Option<String>,
+    /// The number of beats per minute.
+    #[arg(long)]
+    tempo: Option<u32>,
+    /// The minimum length (in steps) of notes generated (ignoring stutter).
+    #[arg(long)]
+    min_len: Option<f32>,
+    /// The maximum length (in steps) of notes generated (ignoring stutter).
+    #[arg(long)]
+    max_len: Option<f32>,
+    /// The pitch of the harmony's lowest note.
+    /// Assumed to be divisible by 12.
+    #[arg(long)]
+    harmony_base: Option<i32>,
+    /// The pitch of the melody's center.
+    #[arg(long)]
+    melody_base: Option<i32>,
+    /// Scales how frequently the speed of notes changes, in measures.
+    #[arg(long)]
+    steady: Option<f32>,
+    /// How strongly the melody oscillates around its center.
+    #[arg(long)]
+    gravity: Option<f32>,
+    /// How strongly the melody's velocity declines.
+    #[arg(long)]
+    drag: Option<f32>,
+    /// The amount of random influence on the melody.
+    #[arg(long)]
+    nudge: Option<f32>,
+    /// The amount of random influence on the speed of notes.
+    #[arg(long)]
+    stutter: Option<f32>,
 }
+
+#[derive(Clone)]
+struct Config {
+    /// The harmony preset to use
+    harmony: Harmony,
+    /// The number of beats per minute.
+    tempo: u32,
+    /// The minimum length (in steps) of notes generated (ignoring stutter).
+    min_len: f32,
+    /// The maximum length (in steps) of notes generated (ignoring stutter).
+    max_len: f32,
+    /// The pitch of the harmony's lowest note.
+    /// Assumed to be divisible by 12.
+    harmony_base: i32,
+    /// The pitch of the melody's center.
+    melody_base: i32,
+    /// Scales how frequently the speed of notes changes, in measures.
+    steady: f32,
+    /// How strongly the melody oscillates around its center.
+    gravity: f32,
+    /// How strongly the melody's velocity declines.
+    drag: f32,
+    /// The amount of random influence on the melody.
+    nudge: f32,
+    /// The amount of random influence on the speed of notes.
+    stutter: f32,
+}
+
+const VERSION1: Config = Config {
+    harmony: Harmony::Quarter,
+    tempo: 80,
+    min_len: 1.0,
+    max_len: 4.0,
+    harmony_base: -12,
+    melody_base: 12,
+    steady: PI,
+    gravity: 0.15,
+    drag: 0.22,
+    nudge: 1.5,
+    stutter: 0.05,
+};
+const VERSION1_1: Config = Config {
+    harmony: Harmony::CenterEighths,
+    min_len: 1.15,
+    max_len: 3.5,
+    ..VERSION1
+};
 
 fn main() {
     use std::io::Write;
-    let Args { repeat, output } = Args::parse();
+    let Args {
+        repeat,
+        output,
+        preset,
+        harmony,
+        tempo,
+        min_len,
+        max_len,
+        harmony_base,
+        melody_base,
+        steady,
+        gravity,
+        drag,
+        nudge,
+        stutter,
+    } = Args::parse();
+    let mut config = match preset.as_str() {
+        "1" => VERSION1.clone(),
+        "1.1" => VERSION1_1.clone(),
+        _ => {
+            eprintln!("Unknown preset {preset:?}");
+            exit(1);
+        }
+    };
+    if let Some(harmony) = harmony {
+        let Some(harmony) = Harmony::from_str(&harmony) else {
+            eprintln!("Unknown harmony {harmony:?}");
+            exit(1);
+        };
+        config.harmony = harmony;
+    }
+    macro_rules! default {
+        ($($field:ident),*) => {
+            $(if let Some($field) = $field {
+                config.$field = $field;
+            })*
+        };
+    }
+    default!(
+        tempo,
+        min_len,
+        max_len,
+        harmony_base,
+        melody_base,
+        steady,
+        gravity,
+        drag,
+        nudge,
+        stutter
+    );
+    if config.harmony_base % 12 != 0 {
+        eprintln!("Harmony can only be adjusted by multiples of 12");
+        exit(1);
+    }
     File::create(&output)
         .unwrap()
-        .write_all(write_music(repeat).as_bytes())
+        .write_all(write_music(&config, repeat).as_bytes())
         .unwrap();
 }
 
-fn write_music(repeat: u32) -> String {
-    let melody = write_melody(repeat);
-    let harmony = write_harmony(repeat);
+fn write_music(config: &Config, repeat: u32) -> String {
+    let melody = write_melody(config, repeat);
+    let harmony = write_harmony(config, repeat);
+    let tempo = config.tempo;
     format!(
         r#"
 \version "2.24.1"
 \score {{
 \new PianoStaff <<
 \new Staff {{
-\tempo 4 = {TEMPO}
+\tempo 4 = {tempo}
 \clef treble
 \key c \major
 \time 4/4
@@ -59,11 +201,14 @@ fn write_music(repeat: u32) -> String {
     )
 }
 
-fn write_melody(repeat: u32) -> String {
+fn write_melody(config: &Config, repeat: u32) -> String {
     let mut melody = "{ ".to_string();
-    let mut state = MelodyState::new();
-    for _ in 0..repeat * REPEAT * CYCLE * MEASURE * STEP {
-        state.next_note(&mut melody);
+    let mut state = MelodyState::new(config);
+    for _ in 0..repeat * REPEAT {
+        for _ in 0..CYCLE * MEASURE * STEP {
+            state.next_note(&mut melody);
+        }
+        melody.push('\n');
     }
     if state.measure_left() != STEP * MEASURE {
         melody.push('r');
@@ -73,8 +218,7 @@ fn write_melody(repeat: u32) -> String {
     melody.push('}');
     melody
 }
-/// The number of beats per minute.
-const TEMPO: u32 = 80;
+
 /// The number of the smallest note generated per beat.
 const STEP: u32 = 4;
 /// The number of beats per measure.
@@ -83,21 +227,21 @@ const MEASURE: u32 = 4;
 const CYCLE: u32 = 4;
 /// The number of cycles in the complete harmony.
 const REPEAT: u32 = 4;
-/// The pitch of the harmony's lowest note.
-/// Assumed to be divisible by 12.
-const HPITCH: i32 = -12;
-/// The pitch of the melody's center.
-const MPITCH: i32 = 12;
-/// Scales how frequently the speed of notes changes.
-const STEADY: f32 = 1.0;
-/// How strongly the melody oscillates around its center.
-const GRAVITY: f32 = 0.15;
-/// How strongly the melody's velocity declines.
-const DRAG: f32 = 0.22;
-/// The amount of random influence on the melody.
-const NUDGE: f32 = 1.5;
-/// The amount of random influence on the speed of notes.
-const STUTTER: f32 = 0.05;
+
+#[derive(Clone)]
+enum Harmony {
+    Quarter,
+    CenterEighths,
+}
+impl Harmony {
+    fn from_str(str: &str) -> Option<Self> {
+        match str {
+            "quarter" => Some(Harmony::Quarter),
+            "center-8ths" => Some(Harmony::CenterEighths),
+            _ => None,
+        }
+    }
+}
 
 const HARMONY: [[[i32; MEASURE as usize]; CYCLE as usize]; REPEAT as usize] = [
     [
@@ -250,44 +394,51 @@ struct Note {
     duration: u32,
 }
 
-struct MelodyState {
+struct MelodyState<'a> {
     pitch: f32,
     velocity: f32,
     progress: f32,
     last_note: u32,
     time: u32,
     note: Note,
+    config: &'a Config,
 }
-impl MelodyState {
-    fn new() -> Self {
+impl<'a> MelodyState<'a> {
+    fn new(config: &'a Config) -> Self {
         MelodyState {
-            pitch: MPITCH as f32,
+            pitch: config.melody_base as f32,
             velocity: 0.0,
             progress: 0.0,
             last_note: 0,
             time: 0,
             note: Note {
-                pitch: Pitch(MPITCH),
+                pitch: Pitch(config.melody_base),
                 duration: 1,
             },
+            config,
         }
     }
     fn measure_left(&self) -> u32 {
         STEP * MEASURE - (self.last_note % (STEP * MEASURE))
     }
     fn next_note(&mut self, out: &mut String) {
-        let nudge = if random() { NUDGE } else { -NUDGE };
-        let gravity = (self.pitch - MPITCH as f32) * -GRAVITY;
-        let velocity = (self.velocity + gravity) * (1.0 - DRAG) + nudge;
+        let nudge = self.config.nudge;
+        let nudge = if random() { nudge } else { -nudge };
+        let gravity = (self.pitch - self.config.melody_base as f32) * -self.config.gravity;
+        let velocity = (self.velocity + gravity) * (1.0 - self.config.drag) + nudge;
         self.pitch += velocity;
         self.velocity = velocity;
 
-        let speed = 3.0 - (self.time as f32 / STEP as f32 / STEADY).cos();
-        let speed = speed * speed / 4.0 / STEP as f32;
+        let med_len: f32 = (self.config.max_len + self.config.min_len) / 2.0;
+        let dev_len: f32 = (self.config.max_len - self.config.min_len) / 2.0;
+        let clock = self.time as f32 * (2.0 * PI) / (STEP * MEASURE) as f32 / self.config.steady;
+        let speed = 1.0 / (dev_len * clock.cos() + med_len);
         self.progress += speed;
 
         self.time += 1;
-        if (self.progress > 1.0 || random::<f32>() < STUTTER) && random::<f32>() > STUTTER {
+        if (self.progress > 1.0 || random::<f32>() < self.config.stutter)
+            && random::<f32>() > self.config.stutter
+        {
             self.progress -= 1.0;
             let measure_left = self.measure_left();
             write!(out, "{}", self.note.pitch).unwrap();
@@ -321,12 +472,20 @@ fn harmony_chord(time: u32) -> &'static [Pitch] {
     }
 }
 
-fn write_harmony(repeat: u32) -> String {
+fn write_harmony(config: &Config, repeat: u32) -> String {
     let mut result = format!("\\repeat unfold {repeat} {{\n");
     for cycle in &HARMONY {
         for chord in cycle {
-            for pitch in chord {
-                write!(&mut result, "{}4 ", Pitch(pitch + HPITCH)).unwrap();
+            match config.harmony {
+                Harmony::Quarter => {
+                    for pitch in chord {
+                        write!(&mut result, "{}4 ", Pitch(pitch + config.harmony_base)).unwrap();
+                    }
+                }
+                Harmony::CenterEighths => {
+                    let [p0, p1, p2, p3] = chord.map(|p| Pitch(p + config.harmony_base));
+                    write!(&mut result, "{p0}4 {p1}8 {p2} {p1} {p2} {p3}4 ").unwrap();
+                }
             }
             result.push_str("| ");
         }
