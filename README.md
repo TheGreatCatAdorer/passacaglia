@@ -1,6 +1,6 @@
 # Passacaglia[^1]
 
-A command-line tool which generates music as [Lilypond files](https://lilypond.org/), which can produce both sheet music and MIDI output.
+A command-line tool which generates music as [Lilypond files](https://lilypond.org/), which can be processed into sheet music, and as MIDI files to be played with an electronic synthesizer.
 
 Passacaglia has a variety of configuration options, selected by command-line options and with presets (named after the versions they were introduced in), including:
 
@@ -8,9 +8,9 @@ Passacaglia has a variety of configuration options, selected by command-line opt
 
 - the `--tempo` in beats per minute
 
-- the `--min-len` and `--max-len` of typical generated notes
+- the `--min-len` and `--max-len` of typical generated notes, in sixteenth notes
 
-- the `--harmony-base` and `--melody-base` pitches
+- the `--harmony-base` and `--melody-base` pitches (half-steps above or below middle C)
 
 - how `--steady` the melody's rhythms are
 
@@ -32,15 +32,32 @@ When the rhythm determines that a note should begin, it is created with a pitch 
 
 The harmony does not vary significantly over a piece: it repeats a chord progression with predetermined notes, and only minor rhythmic customization is possible via the `--harmony` argument. The `--harmony-base` argument is the lowest pitch that the harmony plays.
 
+## Organization
+
+Passacaglia is currently contained in one single file; it has only one meaningful stage. While generating the melody and saving it in some representative format would be ideal, Passacaglia currently ensures that the generated Lilypond and MIDI files match by generating a random seed and re-seeding the PRNG each time. This seed can be found in the generated Lilypond file.
+
+Uniformity between the two is also assured by using the `WriteMusic` trait to implement the music-generation algorithms only once, rather than once per backend. Since notes and chords are handled very differently by the two backends, the trait contains separate functions for the two, and, since Lilypond contains a repetition facility whereas MIDI does not, there is also such a method in the trait, which can either provide textual context (in the case of Lilypond) for a section or make it be generated several times.
+
+The MIDI format itself is very interesting: time signatures have a field to specify how metronome ticks relate to quarter notes and another to specify the number of 32nd notes per quarter (no, I'm not sure why one would change that from 8); tempo is indicated as microseconds per beat, rather than beats per minute, to better fit computer timing systems; and different MIDI tracks within a file can be either ignored, played simultaneously, or interpreted as different, sequential songs. Passacaglia follows Lilypond's convention and plays different tracks simultaneously.
+
+Since I released Passacaglia several months ago and have since found different parameters I prefer, the CLI argument parser takes most options as `Option`s and overlays them onto different presets (defaulting to one that replicates the original behavior).
+
+## Limitations
+
+Passacaglia's key, chord progressions, harmonic expression, and time signature are currently frozen; I'm open to adding flexibility but it would complicate formatting and I'd need to figure out an input format.
+
+In terms of musical quality, it's decent: the syncopation is engaging and sometimes produces some really neat bits, but the algorithm doesn't have any way to approach an ending, and in fact is very likely to stop just when I'd expect one. There also isn't any variation in dynamics yet; if I do add some, I'll probably have it emphasize highs and lows.
+
 ## Changelog
 
-`nightly`
+`1.2.0`
 - Breaking: Added `--force` parameter, which is now required to overwrite a `.ly` file.
 
 - Added additional harmonies: "up-octaves", "down-octaves", "mirror", "triples", "quarter-chords".
 
-- Added harmonic combinations: `+` for random selection and `*` for sequencing.
-  Harmonic combinations only apply to the initial generation: it remains in a `\repeat` block.
+- Added direct MIDI output through the `-m`/`--midi <FILE>` option, with configurable `--volume`.
+
+- Harmonies are now represented in code, rather than Lilypond fragments which are grouped together. This unfortunately degrades the aesthetics, but does allow the same methods to be used between Lilypond and MIDI output.
 
 `1.1.0`
 - Added configuration, including presets and harmonies.

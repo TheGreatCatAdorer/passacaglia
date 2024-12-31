@@ -7,29 +7,41 @@ use std::{
 };
 
 use clap::Parser;
-use rand::{random, Rng};
+use midly::{
+    num::{u24, u28, u4, u7},
+    Format, Header, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
+};
+use rand::{thread_rng, Rng, RngCore, SeedableRng};
 
 /// Generates simple music as Lilypond files.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Number of times to repeat the accompaniment.
+    /// Number of times to repeat the accompaniment
+    ///
     /// Each repetition results in 16 measures of melody.
     #[arg(short, long, default_value_t = 1)]
     repeat: u32,
     /// Path to the Lilypond output
     #[arg(required = true)]
     output: PathBuf,
+    /// Where to generate (optional) separate MIDI output
+    #[arg(short, long)]
+    midi: Option<String>,
     /// Whether to write to a file that already exists
     #[arg(long, default_value_t = false)]
     force: bool,
     /// Which default values to use
-    /// Options: "1", "1.1"
+    ///
+    /// Options: "1", "1.1", "1.2"
     #[arg(long, default_value_t = String::from("1"))]
     preset: String,
+    /// A seed to use for PRNG
+    #[arg(long)]
+    seed: Option<u64>,
     /// The harmony preset to use
+    ///
     /// Options: "quarter", "up-octaves", "down-octaves", "center-8ths", "mirror", "triples", "quarter-chords"
-    /// Can be separated by + to enable random choice and further by * to play in sequence
     #[arg(long)]
     harmony: Option<String>,
     /// The number of beats per minute.
@@ -42,6 +54,7 @@ struct Args {
     #[arg(long)]
     max_len: Option<f32>,
     /// The pitch of the harmony's lowest note.
+    ///
     /// Assumed to be divisible by 12.
     #[arg(long)]
     harmony_base: Option<i32>,
@@ -63,12 +76,17 @@ struct Args {
     /// The amount of random influence on the speed of notes.
     #[arg(long)]
     stutter: Option<f32>,
+    /// The force to use in direct MIDI output.
+    ///
+    /// Must be between 1 and 127.
+    #[arg(long)]
+    volume: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
 struct Config {
     /// A list of series of harmony presets that are randomly chosen from
-    harmony: Vec<Vec<Harmony>>,
+    harmony: Harmony,
     /// The number of beats per minute.
     tempo: u32,
     /// The minimum length (in steps) of notes generated (ignoring stutter).
@@ -90,11 +108,17 @@ struct Config {
     nudge: f32,
     /// The amount of random influence on the speed of notes.
     stutter: f32,
+    /// The number of times to repeat the harmony.
+    repeat: u32,
+    /// The RNG seed used.
+    seed: u64,
+    /// The force to use in direct MIDI output.
+    volume: u8,
 }
 impl Config {
-    fn version_1() -> Config {
+    fn version_1(repeat: u32) -> Config {
         Self {
-            harmony: vec![vec![Harmony::Quarter]],
+            harmony: Harmony::Quarter,
             tempo: 80,
             min_len: 1.0,
             max_len: 4.0,
@@ -105,23 +129,36 @@ impl Config {
             drag: 0.22,
             nudge: 1.5,
             stutter: 0.05,
+            repeat,
+            seed: 0,
+            volume: 90,
         }
     }
-    fn version_1_1() -> Config {
+    fn version_1_1(repeat: u32) -> Config {
         Self {
-            harmony: vec![vec![Harmony::CenterEighths]],
+            harmony: Harmony::CenterEighths,
             min_len: 1.15,
             max_len: 3.5,
-            ..Self::version_1()
+            ..Self::version_1(repeat)
+        }
+    }
+    fn version_1_2(repeat: u32) -> Config {
+        Self {
+            melody_base: 24,
+            ..Self::version_1_1(repeat)
         }
     }
 }
+
+type SeededRng = rand_xoshiro::Xoshiro256StarStar;
 
 fn main() {
     use std::io::Write;
     let Args {
         repeat,
         output,
+        midi,
+        seed,
         force,
         preset,
         harmony,
@@ -135,31 +172,19 @@ fn main() {
         drag,
         nudge,
         stutter,
+        volume,
     } = Args::parse();
     let mut config = match preset.as_str() {
-        "1" => Config::version_1(),
-        "1.1" => Config::version_1_1(),
+        "1" => Config::version_1,
+        "1.1" => Config::version_1_1,
+        "1.2" => Config::version_1_2,
         _ => {
             eprintln!("Unknown preset {preset:?}");
             exit(1);
         }
-    };
-    if let Some(harmony) = harmony {
-        config.harmony = harmony
-            .split('+')
-            .map(|case| {
-                case.split('*')
-                    .map(|s| {
-                        if let Some(harmony) = Harmony::from_str(s) {
-                            harmony
-                        } else {
-                            eprintln!("Unknown harmony {s:?}");
-                            exit(1);
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+    }(repeat);
+    if let Some(harmony) = harmony.and_then(|h| Harmony::from_str(&h)) {
+        config.harmony = harmony;
     }
     macro_rules! default {
         ($($field:ident),*) => {
@@ -178,8 +203,10 @@ fn main() {
         gravity,
         drag,
         nudge,
-        stutter
+        stutter,
+        volume
     );
+    config.seed = seed.unwrap_or_else(|| thread_rng().next_u64());
     if config.harmony_base % 12 != 0 {
         eprintln!("Harmony can only be adjusted by multiples of 12");
         exit(1);
@@ -188,15 +215,36 @@ fn main() {
         eprintln!("The output file has already been written to");
         exit(1);
     }
+    if let Some(midi_output) = midi {
+        let midi = midi_music(&config);
+        midi.write_std(File::create(&midi_output).unwrap()).unwrap();
+    }
     File::create(&output)
         .unwrap()
-        .write_all(write_music(&config, repeat).as_bytes())
+        .write_all(write_music(&config).as_bytes())
         .unwrap();
 }
 
-fn write_music(config: &Config, repeat: u32) -> String {
-    let melody = write_melody(config, repeat);
-    let harmony = write_harmony(config, repeat);
+fn midi_music(config: &Config) -> Smf<'static> {
+    let rng = &mut SeededRng::seed_from_u64(config.seed);
+    let mut state = MelodyState::new(config);
+    let mut melody = MidiWriter::new(config);
+    for _ in 0..config.repeat * REPEAT {
+        for _ in 0..CYCLE * MEASURE * STEP {
+            state.next_note(rng, &mut melody);
+        }
+    }
+    let mut harmony = MidiWriter::new(config);
+    write_harmony(config, &mut harmony);
+    make_midi(config, vec![melody.output, harmony.output])
+}
+
+fn write_music(config: &Config) -> String {
+    let rng = &mut SeededRng::seed_from_u64(config.seed);
+    let melody = write_melody(config, rng);
+    let mut harmony_writer = LilypondWriter::new();
+    write_harmony(config, &mut harmony_writer);
+    let harmony = harmony_writer.output;
     let tempo = config.tempo;
     format!(
         r#"\version "2.24.1"
@@ -226,22 +274,23 @@ fn write_music(config: &Config, repeat: u32) -> String {
     )
 }
 
-fn write_melody(config: &Config, repeat: u32) -> String {
-    let mut melody = "{ ".to_string();
+fn write_melody(config: &Config, rng: &mut SeededRng) -> String {
     let mut state = MelodyState::new(config);
-    for _ in 0..repeat * REPEAT {
+    let mut melody = LilypondWriter::new();
+    melody.output = "{ ".to_string();
+    for _ in 0..config.repeat * REPEAT {
         for _ in 0..CYCLE * MEASURE * STEP {
-            state.next_note(&mut melody);
+            state.next_note(rng, &mut melody);
         }
         melody.push('\n');
     }
     if state.measure_left() != STEP * MEASURE {
         melody.push('r');
-        write_duration(state.measure_left(), &mut melody);
+        write_duration(state.measure_left(), &mut melody.output);
         melody.push(' ');
     }
     melody.push('}');
-    melody
+    melody.output
 }
 
 /// The number of the smallest note generated per beat.
@@ -330,7 +379,7 @@ impl Pitch {
     fn octave(&self) -> i32 {
         self.0.div_euclid(12)
     }
-    fn nearest_note(&self, pitches: &[Self]) -> Self {
+    fn nearest_note(&self, rng: &mut SeededRng, pitches: &[Self]) -> Self {
         assert!(!pitches.is_empty());
         let mut best = 12;
         let mut nearest = *self;
@@ -345,7 +394,7 @@ impl Pitch {
             } else if diff < best {
                 nearest = pitch.note();
                 best = diff;
-            } else if diff == best && random() {
+            } else if diff == best && rng.gen() {
                 nearest = pitch.note();
             }
         }
@@ -429,6 +478,167 @@ struct Note {
     duration: u32,
 }
 
+trait WriteMusic {
+    fn write_note(&mut self, note: Note);
+    fn write_chord(&mut self, chord: &[Pitch], duration: u32);
+    fn repeat(&mut self, times: u32, inner: impl Fn(&mut Self));
+}
+
+struct LilypondWriter {
+    measure_left: u32,
+    output: String,
+}
+impl LilypondWriter {
+    fn new() -> Self {
+        Self {
+            measure_left: STEP * MEASURE,
+            output: String::new(),
+        }
+    }
+    fn push(&mut self, ch: char) {
+        self.output.push(ch);
+    }
+    fn write_duration(&mut self, duration: u32) {
+        write_duration(duration.min(self.measure_left), &mut self.output);
+        if duration > self.measure_left {
+            self.output.push('~');
+            write_duration(duration - self.measure_left, &mut self.output);
+            self.measure_left += STEP * MEASURE;
+        }
+        self.output.push(' ');
+        self.measure_left -= duration;
+        if self.measure_left == 0 {
+            self.measure_left = STEP * MEASURE;
+        }
+    }
+}
+
+impl WriteMusic for LilypondWriter {
+    fn write_note(&mut self, Note { pitch, duration }: Note) {
+        write!(&mut self.output, "{pitch}").unwrap();
+        self.write_duration(duration);
+    }
+    fn write_chord(&mut self, chord: &[Pitch], duration: u32) {
+        self.output.push('<');
+        for (i, pitch) in chord.iter().enumerate() {
+            write!(&mut self.output, "{pitch}").unwrap();
+            if i < chord.len() - 1 {
+                self.output.push(' ');
+            }
+        }
+        self.output.push('>');
+        self.write_duration(duration);
+    }
+    fn repeat(&mut self, times: u32, inner: impl Fn(&mut Self)) {
+        write!(&mut self.output, "\\repeat unfold {times} {{\n").unwrap();
+        inner(self);
+        self.output.push('}');
+    }
+}
+
+struct MidiWriter {
+    volume: u7,
+    output: Track<'static>,
+}
+impl MidiWriter {
+    fn new(config: &Config) -> Self {
+        MidiWriter {
+            volume: u7::new(config.volume),
+            output: vec![],
+        }
+    }
+}
+fn make_midi<'a>(config: &Config, mut tracks: Vec<Track<'a>>) -> Smf<'a> {
+    let control = vec![
+        TrackEvent {
+            delta: u28::new(0),
+            // Represents a time signature MEASURE/4
+            // 24 times 1/24 of a quarter note is one beat/metronome tick
+            // 8 is the number of 32nd notes per quarter
+            kind: TrackEventKind::Meta(MetaMessage::TimeSignature(MEASURE as u8, 4, 24, 8)),
+        },
+        TrackEvent {
+            delta: u28::new(0),
+            // microseconds/beat
+            kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(60_000_000 / config.tempo))),
+        },
+        TrackEvent {
+            delta: u28::new(STEP * MEASURE * CYCLE * REPEAT * config.repeat),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        },
+    ];
+    tracks.insert(0, control);
+    Smf {
+        header: Header {
+            format: Format::Parallel,
+            timing: Timing::Metrical((STEP as u16).into()),
+        },
+        tracks,
+    }
+}
+fn pitch_to_midi(Pitch(pitch): Pitch) -> u7 {
+    const MIDDLE_C: i32 = 48;
+    u7::new((pitch + MIDDLE_C).try_into().unwrap())
+}
+
+impl WriteMusic for MidiWriter {
+    fn write_note(&mut self, Note { pitch, duration }: Note) {
+        self.output.push(TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOn {
+                    key: pitch_to_midi(pitch),
+                    vel: self.volume,
+                },
+            },
+        });
+        self.output.push(TrackEvent {
+            delta: u28::new(duration),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOn {
+                    key: pitch_to_midi(pitch),
+                    vel: u7::new(0),
+                },
+            },
+        });
+    }
+    fn write_chord(&mut self, chord: &[Pitch], duration: u32) {
+        for &pitch in chord {
+            self.output.push(TrackEvent {
+                delta: u28::new(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::new(0),
+                    message: MidiMessage::NoteOn {
+                        key: pitch_to_midi(pitch),
+                        vel: self.volume,
+                    },
+                },
+            });
+        }
+        let mut delta: Option<u28> = Some(u28::new(duration));
+        for &pitch in chord {
+            let delta = delta.take().unwrap_or(u28::new(0));
+            self.output.push(TrackEvent {
+                delta,
+                kind: TrackEventKind::Midi {
+                    channel: u4::new(0),
+                    message: MidiMessage::NoteOn {
+                        key: pitch_to_midi(pitch),
+                        vel: u7::new(0),
+                    },
+                },
+            });
+        }
+    }
+    fn repeat(&mut self, times: u32, inner: impl Fn(&mut Self)) {
+        for _ in 0..times {
+            inner(self);
+        }
+    }
+}
+
 struct MelodyState<'a> {
     pitch: f32,
     velocity: f32,
@@ -456,9 +666,9 @@ impl<'a> MelodyState<'a> {
     fn measure_left(&self) -> u32 {
         STEP * MEASURE - (self.last_note % (STEP * MEASURE))
     }
-    fn next_note(&mut self, out: &mut String) {
+    fn next_note(&mut self, rng: &mut SeededRng, out: &mut impl WriteMusic) {
         let nudge = self.config.nudge;
-        let nudge = if random() { nudge } else { -nudge };
+        let nudge = if rng.gen() { nudge } else { -nudge };
         let gravity = (self.pitch - self.config.melody_base as f32) * -self.config.gravity;
         let velocity = (self.velocity + gravity) * (1.0 - self.config.drag) + nudge;
         self.pitch += velocity;
@@ -471,22 +681,15 @@ impl<'a> MelodyState<'a> {
         self.progress += speed;
 
         self.time += 1;
-        if (self.progress > 1.0 || random::<f32>() < self.config.stutter)
-            && random::<f32>() > self.config.stutter
+        if (self.progress > 1.0 || rng.gen::<f32>() < self.config.stutter)
+            && rng.gen::<f32>() > self.config.stutter
         {
             self.progress -= 1.0;
-            let measure_left = self.measure_left();
-            write!(out, "{}", self.note.pitch).unwrap();
-            write_duration(self.note.duration.min(measure_left), out);
-            if self.note.duration > measure_left {
-                out.push('~');
-                write_duration(self.note.duration - measure_left, out);
-            }
-            out.push(' ');
+            out.write_note(self.note);
             self.last_note = self.time;
             let mut pitch = Pitch(self.pitch.round() as i32);
             if self.last_note % STEP != STEP - 1 {
-                pitch = pitch.nearest_note(&harmony_chord(self.time));
+                pitch = pitch.nearest_note(rng, &harmony_chord(self.time));
             }
             self.note = Note { pitch, duration: 1 };
         } else {
@@ -507,64 +710,91 @@ fn harmony_chord(time: u32) -> &'static [Pitch] {
     }
 }
 
-fn write_harmony(config: &Config, repeat: u32) -> String {
-    let mut result = format!("\\repeat unfold {repeat} {{\n");
-    let mut harmony_queue = vec![];
-    for cycle in &HARMONY {
-        for chord in cycle {
-            if harmony_queue.is_empty() {
-                harmony_queue =
-                    config.harmony[rand::thread_rng().gen_range(0..config.harmony.len())].clone();
+fn write_harmony(config: &Config, out: &mut impl WriteMusic) {
+    let note = |pitch, duration| Note {
+        pitch: Pitch(pitch + config.harmony_base),
+        duration,
+    };
+    out.repeat(config.repeat, |out| {
+        for cycle in &HARMONY {
+            for chord in cycle {
+                let [p0, p1, p2, p3] = *chord;
+                match config.harmony {
+                    Harmony::Quarter => {
+                        for &pitch in chord {
+                            out.write_note(note(pitch, 4));
+                        }
+                    }
+                    Harmony::UpOctaves => {
+                        for &pitch in chord {
+                            out.write_note(note(pitch - 12, 2));
+                            out.write_note(note(pitch, 2));
+                        }
+                    }
+                    Harmony::DownOctaves => {
+                        for &pitch in chord {
+                            out.write_note(note(pitch, 2));
+                            out.write_note(note(pitch - 12, 2));
+                        }
+                    }
+                    Harmony::CenterEighths => {
+                        let harmony = [
+                            note(p0, 4),
+                            note(p1, 2),
+                            note(p2, 2),
+                            note(p1, 2),
+                            note(p2, 2),
+                            note(p3, 4),
+                        ];
+                        for note in harmony {
+                            out.write_note(note);
+                        }
+                    }
+                    Harmony::Mirror => {
+                        let harmony = [
+                            note(p0, 2),
+                            note(p0 - 12, 2),
+                            note(p1 - 12, 2),
+                            note(p2 - 12, 2),
+                            note(p3 - 12, 2),
+                            note(p1, 2),
+                            note(p2, 2),
+                            note(p3, 2),
+                        ];
+                        for note in harmony {
+                            out.write_note(note);
+                        }
+                    }
+                    Harmony::Triples => {
+                        let harmony = [
+                            note(p0, 1),
+                            note(p1, 1),
+                            note(p2, 2),
+                            note(p0, 1),
+                            note(p1, 1),
+                            note(p2, 2),
+                            note(p1, 1),
+                            note(p2, 1),
+                            note(p3, 2),
+                            note(p3, 4),
+                        ];
+                        for note in harmony {
+                            out.write_note(note);
+                        }
+                    }
+                    Harmony::QuarterChords => {
+                        let harmony = [[p0, p1, p2], [p0, p1, p3], [p0, p2, p3], [p1, p2, p3]];
+                        for [d0, d1, d2] in harmony {
+                            let chord = [
+                                Pitch(d0 + config.harmony_base),
+                                Pitch(d1 + config.harmony_base),
+                                Pitch(d2 + config.harmony_base),
+                            ];
+                            out.write_chord(&chord, 4);
+                        }
+                    }
+                }
             }
-            let harmony = harmony_queue.remove(0);
-            match harmony {
-                Harmony::Quarter => {
-                    for pitch in chord {
-                        write!(&mut result, "{}4 ", Pitch(pitch + config.harmony_base)).unwrap();
-                    }
-                }
-                Harmony::UpOctaves => {
-                    for pitch in chord {
-                        let pitch = pitch + config.harmony_base;
-                        write!(&mut result, "{}8 {}", Pitch(pitch - 12), Pitch(pitch)).unwrap();
-                    }
-                }
-                Harmony::DownOctaves => {
-                    for pitch in chord {
-                        let pitch = pitch + config.harmony_base;
-                        write!(&mut result, "{}8 {}", Pitch(pitch), Pitch(pitch - 12)).unwrap();
-                    }
-                }
-                Harmony::CenterEighths => {
-                    let [p0, p1, p2, p3] = chord.map(|p| Pitch(p + config.harmony_base));
-                    write!(&mut result, "{p0}4 {p1}8 {p2} {p1} {p2} {p3}4 ").unwrap();
-                }
-                Harmony::Mirror => {
-                    let [p0, p1, p2, p3] = chord.map(|p| Pitch(p + config.harmony_base));
-                    let [d0, d1, d2, d3] = chord.map(|p| Pitch(p + config.harmony_base - 12));
-                    write!(&mut result, "{p0}8 {d0} {d1} {d2} {d3} {p1} {p2} {p3} ").unwrap();
-                }
-                Harmony::Triples => {
-                    let [p0, p1, p2, p3] = chord.map(|p| Pitch(p + config.harmony_base));
-                    write!(
-                        &mut result,
-                        "{p0}16 {p1} {p2}8 {p0}16 {p1} {p2}8 {p1}16 {p2} {p3}8 {p3}4 "
-                    )
-                    .unwrap();
-                }
-                Harmony::QuarterChords => {
-                    let [p0, p1, p2, p3] = chord.map(|p| Pitch(p + config.harmony_base));
-                    write!(
-                        &mut result,
-                        "<{p0} {p1} {p2}>4 <{p0} {p1} {p3}>4 <{p0} {p2} {p3}>4 <{p1} {p2} {p3}>4 "
-                    )
-                    .unwrap();
-                }
-            }
-            result.push_str("| ");
         }
-        result.push('\n');
-    }
-    result.push('}');
-    result
+    });
 }
