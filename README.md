@@ -46,9 +46,12 @@ Since I released Passacaglia several months ago and have since found different p
 
 Passacaglia's key, chord progressions, harmonic expression, and time signature are currently frozen; I'm open to adding flexibility but it would complicate formatting and I'd need to figure out an input format.
 
-In terms of musical quality, it's decent: the syncopation is engaging and sometimes produces some really neat bits, but the algorithm doesn't have any way to approach an ending, and in fact is very likely to stop just when I'd expect one. There also isn't any variation in dynamics yet; if I do add some, I'll probably have it emphasize highs and lows.
+In terms of musical quality, it's decent: the syncopation is engaging and sometimes produces some really neat bits, but the algorithm doesn't have any way to approach an ending, and in fact is very likely to stop just when I'd expect one. (The new sawtooth rhythms might help with this.) There also isn't any variation in dynamics yet; if I do add some, I'll probably have it emphasize highs and lows.
 
 ## Changelog
+
+`1.3.0`
+- Added sawtooth-based `--rhythm`s: the notes slowly quicken until they abruptly slow down again, rather than smoothly quickening and slowing with the sinusoidal pattern. Such rhythms are not included in any presets.
 
 `1.2.0`
 - Breaking: Added `--force` parameter, which is now required to overwrite a `.ly` file.

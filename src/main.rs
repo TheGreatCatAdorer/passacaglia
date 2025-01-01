@@ -1,5 +1,5 @@
 use std::{
-    f32::consts::PI,
+    f64::consts::PI,
     fmt::{Display, Write},
     fs::File,
     path::PathBuf,
@@ -44,6 +44,13 @@ struct Args {
     /// Options: "quarter", "up-octaves", "down-octaves", "center-8ths", "mirror", "triples", "quarter-chords"
     #[arg(long)]
     harmony: Option<String>,
+    /// The rhythm tendency to use
+    ///
+    /// "sinusoidal"/"sine": Gradual transitions from short notes to long notes and back
+    ///
+    /// "saw"/"sawtooth": Quickening notes followed by an abrupt stop
+    #[arg(long)]
+    rhythm: Option<String>,
     /// The number of beats per minute.
     #[arg(long)]
     tempo: Option<u32>,
@@ -85,8 +92,10 @@ struct Args {
 
 #[derive(Clone, Debug)]
 struct Config {
-    /// A list of series of harmony presets that are randomly chosen from
+    /// The harmony preset to use
     harmony: Harmony,
+    /// The rhythm tendency to use
+    rhythm: Rhythm,
     /// The number of beats per minute.
     tempo: u32,
     /// The minimum length (in steps) of notes generated (ignoring stutter).
@@ -119,12 +128,13 @@ impl Config {
     fn version_1(repeat: u32) -> Config {
         Self {
             harmony: Harmony::Quarter,
+            rhythm: Rhythm::Sinusoidal,
             tempo: 80,
             min_len: 1.0,
             max_len: 4.0,
             harmony_base: -12,
             melody_base: 12,
-            steady: PI,
+            steady: PI as f32,
             gravity: 0.15,
             drag: 0.22,
             nudge: 1.5,
@@ -162,6 +172,7 @@ fn main() {
         force,
         preset,
         harmony,
+        rhythm,
         tempo,
         min_len,
         max_len,
@@ -185,6 +196,10 @@ fn main() {
     }(repeat);
     if let Some(harmony) = harmony.and_then(|h| Harmony::from_str(&h)) {
         config.harmony = harmony;
+    }
+    if let Some(rhythm) = rhythm.and_then(|r| Rhythm::from_str(&r)) {
+        dbg!(&rhythm);
+        config.rhythm = rhythm;
     }
     macro_rules! default {
         ($($field:ident),*) => {
@@ -369,6 +384,21 @@ const HARMONY: [[[i32; MEASURE as usize]; CYCLE as usize]; REPEAT as usize] = [
         [-1, 2, 7, 5],
     ],
 ];
+
+#[derive(Clone, Debug)]
+enum Rhythm {
+    Sinusoidal,
+    Sawtooth,
+}
+impl Rhythm {
+    fn from_str(str: &str) -> Option<Self> {
+        match str {
+            "sine" | "sinusoidal" => Some(Rhythm::Sinusoidal),
+            "saw" | "sawtooth" => Some(Rhythm::Sawtooth),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Pitch(i32);
@@ -676,10 +706,14 @@ impl<'a> MelodyState<'a> {
 
         let med_len: f32 = (self.config.max_len + self.config.min_len) / 2.0;
         let dev_len: f32 = (self.config.max_len - self.config.min_len) / 2.0;
-        let clock = self.time as f32 * (2.0 * PI) / (STEP * MEASURE) as f32 / self.config.steady;
-        let speed = 1.0 / (dev_len * clock.cos() + med_len);
+        let clock = self.time as f64 / (STEP * MEASURE) as f64 / self.config.steady as f64;
+        // Positive increases time to next note; negative decreases it.
+        let add_time = match &self.config.rhythm {
+            Rhythm::Sinusoidal => (clock * 2.0 * PI).cos() as f32,
+            Rhythm::Sawtooth => 1.0 - 2.0 * (clock as f32 % 1.0),
+        };
+        let speed = 1.0 / (dev_len * add_time + med_len);
         self.progress += speed;
-
         self.time += 1;
         if (self.progress > 1.0 || rng.gen::<f32>() < self.config.stutter)
             && rng.gen::<f32>() > self.config.stutter
